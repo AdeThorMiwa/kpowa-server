@@ -3,21 +3,24 @@ use std::{
     fmt::{Debug, Display},
     net::SocketAddr,
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_stream::try_stream;
 use axum::{
     extract::State,
-    http::StatusCode,
+    headers::{authorization::Bearer, Authorization},
+    http::{Request, StatusCode},
+    middleware::{self, Next},
     response::{
         sse::{Event, KeepAlive},
-        IntoResponse, Sse,
+        IntoResponse, Response, Sse,
     },
     routing::{get, post},
-    Json, Router,
+    Extension, Json, Router, TypedHeader,
 };
 use futures::stream::Stream;
+use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use rand::{distributions::Uniform, prelude::Distribution};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -41,8 +44,12 @@ enum AppEvent {
     NewReferral(NewReferralEvent),
 }
 
+#[derive(Clone)]
+struct Db(Pool<Postgres>);
+
+#[derive(Clone)]
 struct AppState {
-    db_pool: Pool<Postgres>,
+    db_pool: Db,
 
     tx: broadcast::Sender<AppEvent>,
 }
@@ -58,14 +65,16 @@ struct AuthenticateResponse {
     username: String,
     invite_code: String,
     referrals: u32,
+    token: String,
 }
 
-impl From<(User, u32)> for AuthenticateResponse {
-    fn from((user, referrals): (User, u32)) -> Self {
+impl From<(User, u32, String)> for AuthenticateResponse {
+    fn from((user, referrals, token): (User, u32, String)) -> Self {
         Self {
             username: user.username.inner(),
             invite_code: user.invite_code.inner(),
             referrals,
+            token,
         }
     }
 }
@@ -77,6 +86,7 @@ enum DatabaseError {
 enum ApiError {
     InvalidInviteCode,
     ServerError,
+    AuthenticationError,
 }
 
 impl From<DatabaseError> for ApiError {
@@ -92,6 +102,7 @@ impl IntoResponse for ApiError {
         let (status, error_message) = match self {
             Self::InvalidInviteCode => (StatusCode::BAD_REQUEST, "Invalid invite code"),
             Self::ServerError => (StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong"),
+            Self::AuthenticationError => (StatusCode::UNAUTHORIZED, "Authentication failed"),
         };
 
         let body = Json(json!({
@@ -121,17 +132,24 @@ async fn main() {
         .connect(&db_url)
         .await
         .expect("can't connect to database");
+    let pool = Db(pool);
 
     let cors = CorsLayer::new().allow_origin(Any);
     let (tx, _rx) = broadcast::channel(100);
 
-    let app_state = Arc::new(AppState { db_pool: pool, tx });
+    let app_state = Arc::new(AppState {
+        db_pool: pool.clone(),
+        tx,
+    });
+
     let app = Router::new()
+        .route("/stream", get(stream))
+        .route_layer(middleware::from_fn(check_auth))
         .route("/health", get(health))
         .route("/authenticate", post(authenticate))
-        .route("/stream", get(stream))
         .with_state(app_state)
-        .layer(cors);
+        .layer(cors)
+        .layer(Extension(pool.clone()));
 
     let addr = "0.0.0.0:8009".parse::<SocketAddr>().unwrap();
     tracing::info!("listening on {}", addr.port());
@@ -145,14 +163,15 @@ async fn authenticate(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<AuthenticateRequest>,
 ) -> Result<Json<AuthenticateResponse>, ApiError> {
-    let pool = state.db_pool.clone();
+    let pool = state.db_pool.clone().0;
     tracing::info!("authenticating user >>> {}", payload.username);
     let user = get_user_by_username(&pool, &payload.username).await?;
 
     if let Some(user) = user {
         let referrals = get_user_referral_count(&pool, &user.username).await?;
         let _ = state.tx.send(AppEvent::NewLogin(user.clone()));
-        return Ok(Json((user, referrals).into()));
+        let token = generate_auth_token(&user.username)?;
+        return Ok(Json((user, referrals, token).into()));
     }
 
     let referrer_id = if let Some(invite_code) = payload.invitation_code {
@@ -184,7 +203,8 @@ async fn authenticate(
     let referrals = get_user_referral_count(&pool, &user.username).await?;
 
     let _ = state.tx.send(AppEvent::NewRegister(user.clone()));
-    Ok(Json((user, referrals).into()))
+    let token = generate_auth_token(&user.username)?;
+    Ok(Json((user, referrals, token).into()))
 }
 
 async fn health() -> Json<Value> {
@@ -197,10 +217,11 @@ async fn stream(
     State(state): State<Arc<AppState>>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     tracing::info!("new connection to sse stream >>>");
+
     let mut rx = state.tx.clone().subscribe();
 
     Sse::new(try_stream! {
-            loop {
+        loop {
             match rx.recv().await {
                 Ok(i) => {
                     let event = Event::default().data(serde_json::to_string(&i).unwrap());
@@ -215,6 +236,28 @@ async fn stream(
         }
     })
     .keep_alive(KeepAlive::default())
+}
+
+async fn check_auth<B>(
+    TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
+    request: Request<B>,
+    next: Next<B>,
+) -> Response {
+    let token = decode_auth_token(auth.token());
+
+    let db = match request.extensions().get::<Db>() {
+        Some(s) => s,
+        None => return (StatusCode::INTERNAL_SERVER_ERROR).into_response(),
+    };
+
+    if let Ok(claims) = token {
+        if let Ok(Some(_user)) = get_user_by_username(&db.0, &claims.sub.into()).await {
+            let response = next.run(request).await;
+            return response;
+        }
+    }
+
+    (StatusCode::UNAUTHORIZED).into_response()
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -365,4 +408,52 @@ async fn get_user_referral_count(pool: &PgPool, username: &Username) -> Result<u
     .map_err(|_| DatabaseError::ServerError)?;
 
     Ok(count.referral_count.unwrap_or(0) as u32)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Claims {
+    sub: String,
+    iss: String,
+    exp: usize,
+}
+
+#[derive(Debug)]
+enum JWTError {
+    GenerationFailed(jsonwebtoken::errors::ErrorKind),
+    DecodeFailed(jsonwebtoken::errors::ErrorKind),
+}
+
+impl From<JWTError> for ApiError {
+    fn from(_value: JWTError) -> Self {
+        Self::AuthenticationError
+    }
+}
+
+fn generate_auth_token(username: &Username) -> Result<String, JWTError> {
+    let exp = SystemTime::now() + Duration::from_secs(86400);
+    let claims = Claims {
+        iss: "killpowa".to_string(),
+        sub: username.inner(),
+        exp: exp.duration_since(UNIX_EPOCH).unwrap().as_secs() as usize,
+    };
+
+    let token = encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret("secret".as_ref()),
+    )
+    .map_err(|e| JWTError::GenerationFailed(e.into_kind()))?;
+
+    Ok(token)
+}
+
+fn decode_auth_token(token: &str) -> Result<Claims, JWTError> {
+    let token_data = decode::<Claims>(
+        &token,
+        &DecodingKey::from_secret("secret".as_ref()),
+        &Validation::default(),
+    )
+    .map_err(|e| JWTError::DecodeFailed(e.into_kind()))?;
+
+    Ok(token_data.claims)
 }
