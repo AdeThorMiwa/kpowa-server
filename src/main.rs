@@ -55,6 +55,7 @@ struct AppState {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct AuthenticateRequest {
     username: Username,
     invitation_code: Option<InviteCode>,
@@ -62,20 +63,12 @@ struct AuthenticateRequest {
 
 #[derive(Serialize)]
 struct AuthenticateResponse {
-    username: String,
-    invite_code: String,
-    referrals: u32,
     token: String,
 }
 
-impl From<(User, u32, String)> for AuthenticateResponse {
-    fn from((user, referrals, token): (User, u32, String)) -> Self {
-        Self {
-            username: user.username.inner(),
-            invite_code: user.invite_code.inner(),
-            referrals,
-            token,
-        }
+impl From<String> for AuthenticateResponse {
+    fn from(token: String) -> Self {
+        Self { token }
     }
 }
 
@@ -134,7 +127,7 @@ async fn main() {
         .expect("can't connect to database");
     let pool = Db(pool);
 
-    let cors = CorsLayer::new().allow_origin(Any);
+    let cors = CorsLayer::permissive();
     let (tx, _rx) = broadcast::channel(100);
 
     let app_state = Arc::new(AppState {
@@ -144,12 +137,13 @@ async fn main() {
 
     let app = Router::new()
         .route("/stream", get(stream))
+        .route("/user", get(get_authenticated_user))
         .route_layer(middleware::from_fn(check_auth))
         .route("/health", get(health))
         .route("/authenticate", post(authenticate))
         .with_state(app_state)
-        .layer(cors)
-        .layer(Extension(pool.clone()));
+        .layer(Extension(pool.clone()))
+        .layer(cors);
 
     let addr = "0.0.0.0:8009".parse::<SocketAddr>().unwrap();
     tracing::info!("listening on {}", addr.port());
@@ -168,10 +162,9 @@ async fn authenticate(
     let user = get_user_by_username(&pool, &payload.username).await?;
 
     if let Some(user) = user {
-        let referrals = get_user_referral_count(&pool, &user.username).await?;
         let _ = state.tx.send(AppEvent::NewLogin(user.clone()));
         let token = generate_auth_token(&user.username)?;
-        return Ok(Json((user, referrals, token).into()));
+        return Ok(Json(token.into()));
     }
 
     let referrer_id = if let Some(invite_code) = payload.invitation_code {
@@ -200,11 +193,26 @@ async fn authenticate(
         }));
     }
 
-    let referrals = get_user_referral_count(&pool, &user.username).await?;
-
     let _ = state.tx.send(AppEvent::NewRegister(user.clone()));
     let token = generate_auth_token(&user.username)?;
-    Ok(Json((user, referrals, token).into()))
+    Ok(Json(token.into()))
+}
+
+#[derive(Serialize)]
+
+struct AuthenticatedUserResponse {
+    #[serde(flatten)]
+    user: User,
+    referrals: u32,
+}
+
+async fn get_authenticated_user(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<User>,
+) -> Result<Json<AuthenticatedUserResponse>, ApiError> {
+    let pool = state.db_pool.clone().0;
+    let referrals = get_user_referral_count(&pool, &user.username).await?;
+    Ok(Json(AuthenticatedUserResponse { user, referrals }))
 }
 
 async fn health() -> Json<Value> {
@@ -240,7 +248,7 @@ async fn stream(
 
 async fn check_auth<B>(
     TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
-    request: Request<B>,
+    mut request: Request<B>,
     next: Next<B>,
 ) -> Response {
     let token = decode_auth_token(auth.token());
@@ -251,7 +259,8 @@ async fn check_auth<B>(
     };
 
     if let Ok(claims) = token {
-        if let Ok(Some(_user)) = get_user_by_username(&db.0, &claims.sub.into()).await {
+        if let Ok(Some(user)) = get_user_by_username(&db.0, &claims.sub.into()).await {
+            request.extensions_mut().insert(user);
             let response = next.run(request).await;
             return response;
         }
