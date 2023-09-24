@@ -24,7 +24,7 @@ use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation}
 use rand::{distributions::Uniform, prelude::Distribution};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sqlx::{postgres::PgPoolOptions, PgPool, Pool, Postgres};
+use sqlx::{postgres::PgPoolOptions, FromRow, PgPool, Pool, Postgres, QueryBuilder};
 use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -186,7 +186,10 @@ async fn authenticate(
         code
     };
 
-    let user = create_new_user(&pool, &payload.username, &invite_code, referrer_id).await?;
+    let _ = create_new_user(&pool, &payload.username, &invite_code, referrer_id).await?;
+    let user = get_user_by_username(&pool, &payload.username)
+        .await?
+        .unwrap();
     if user.referred_by.is_some() {
         let _ = state.tx.send(AppEvent::NewReferral(NewReferralEvent {
             referred_user: user.clone().username,
@@ -204,20 +207,17 @@ async fn authenticate(
 struct AuthenticatedUserResponse {
     #[serde(flatten)]
     user: User,
-    referrals: u32,
 }
 
 async fn get_authenticated_user(
-    State(state): State<Arc<AppState>>,
     Extension(user): Extension<User>,
 ) -> Result<Json<AuthenticatedUserResponse>, ApiError> {
-    let pool = state.db_pool.clone().0;
-    let referrals = get_user_referral_count(&pool, &user.username).await?;
-    Ok(Json(AuthenticatedUserResponse { user, referrals }))
+    Ok(Json(AuthenticatedUserResponse { user }))
 }
 
 #[derive(Deserialize)]
 struct QueryParams {
+    username: Option<String>,
     page: Option<i64>,
     limit: Option<i64>,
 }
@@ -247,7 +247,13 @@ async fn get_users(
     let limit = query.limit.unwrap_or(10);
     let skip = (page - 1) * limit;
 
-    let users = fetch_users(&pool, skip, limit).await?;
+    let query = FetchUserQuery {
+        username: query.username,
+        limit,
+        skip,
+    };
+
+    let users = fetch_users(&pool, query).await?;
     let count = fetch_total_user_count(&pool).await?;
 
     let total_pages = (count / limit) + 1;
@@ -379,14 +385,16 @@ struct User {
     username: Username,
     invite_code: InviteCode,
     referred_by: Option<Username>,
+    referrals: i64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, FromRow)]
 struct DbUser {
     uid: Uuid,
     username: String,
     invite_code: String,
     referred_by: Option<String>,
+    referrals: Option<i64>,
 }
 
 impl From<DbUser> for User {
@@ -395,6 +403,7 @@ impl From<DbUser> for User {
             username: value.username.into(),
             invite_code: value.invite_code.into(),
             referred_by: value.referred_by.map(|r| Username::from(r)),
+            referrals: value.referrals.unwrap_or(0),
         }
     }
 }
@@ -405,7 +414,7 @@ async fn get_user_by_username(
 ) -> Result<Option<User>, DatabaseError> {
     let user = sqlx::query_as!(
         DbUser,
-        "select * from users where username = $1",
+        "select a.*, (select count(referred_by) from users as b where b.referred_by=a.username) as referrals from users as a where username = $1",
         username.inner()
     )
     .fetch_optional(pool)
@@ -421,7 +430,7 @@ async fn get_user_by_invite_code(
 ) -> Result<Option<User>, DatabaseError> {
     let user = sqlx::query_as!(
         DbUser,
-        "select * from users where invite_code = $1",
+        "select a.*, (select count(referred_by) from users as b where b.referred_by=a.username) as referrals from users as a where invite_code = $1",
         invite_code.inner()
     )
     .fetch_optional(pool)
@@ -436,10 +445,9 @@ async fn create_new_user(
     username: &Username,
     invite_code: &InviteCode,
     referred_by: Option<Username>,
-) -> Result<User, DatabaseError> {
-    let user = sqlx::query_as!(
-        DbUser,
-        "insert into users (uid, username, invite_code, referred_by) values ($1, $2, $3, $4) returning *",
+) -> Result<(), DatabaseError> {
+    sqlx::query!(
+        "insert into users (uid, username, invite_code, referred_by) values ($1, $2, $3, $4)",
         Uuid::new_v4(),
         username.inner(),
         invite_code.inner(),
@@ -447,35 +455,36 @@ async fn create_new_user(
     )
     .fetch_one(pool)
     .await
-    .map_err(|_| {
-        DatabaseError::ServerError
-    })?;
-
-    Ok(user.into())
-}
-
-async fn get_user_referral_count(pool: &PgPool, username: &Username) -> Result<u32, DatabaseError> {
-    let count = sqlx::query!(
-        "select count(*) as referral_count from users where referred_by = $1",
-        username.inner(),
-    )
-    .fetch_one(pool)
-    .await
     .map_err(|_| DatabaseError::ServerError)?;
 
-    Ok(count.referral_count.unwrap_or(0) as u32)
+    Ok(())
 }
 
-async fn fetch_users(pool: &PgPool, skip: i64, limit: i64) -> Result<Vec<User>, DatabaseError> {
-    let users: Vec<DbUser> = sqlx::query_as!(
-        DbUser,
-        "select * from users order by username desc limit $1 offset $2",
-        limit,
-        skip
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(|_| DatabaseError::ServerError)?;
+struct FetchUserQuery {
+    username: Option<String>,
+    skip: i64,
+    limit: i64,
+}
+
+async fn fetch_users(pool: &PgPool, query: FetchUserQuery) -> Result<Vec<User>, DatabaseError> {
+    let mut builder = QueryBuilder::new("select a.*, (select count(referred_by) from users as b where b.referred_by=a.username) as referrals from users as a ");
+
+    if let Some(username) = query.username {
+        builder.push(" where username = ");
+        builder.push_bind(username);
+    }
+
+    builder.push(" order by username desc limit ");
+    builder.push_bind(query.limit);
+
+    builder.push(" offset ");
+    builder.push_bind(query.skip);
+
+    let users = builder
+        .build_query_as::<DbUser>()
+        .fetch_all(pool)
+        .await
+        .map_err(|_| DatabaseError::ServerError)?;
 
     let users: Vec<User> = users.into_iter().map(|u| u.into()).collect();
     Ok(users)
@@ -510,7 +519,7 @@ impl From<JWTError> for ApiError {
 }
 
 fn generate_auth_token(username: &Username) -> Result<String, JWTError> {
-    let exp = SystemTime::now() + Duration::from_secs(86400);
+    let exp = SystemTime::now() + Duration::from_secs(864000);
     let claims = Claims {
         iss: "killpowa".to_string(),
         sub: username.inner(),
