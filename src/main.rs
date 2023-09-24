@@ -8,7 +8,7 @@ use std::{
 
 use async_stream::try_stream;
 use axum::{
-    extract::State,
+    extract::{Query, State},
     headers::{authorization::Bearer, Authorization},
     http::{Request, StatusCode},
     middleware::{self, Next},
@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{postgres::PgPoolOptions, PgPool, Pool, Postgres};
 use tokio::sync::broadcast;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
@@ -137,7 +137,8 @@ async fn main() {
 
     let app = Router::new()
         .route("/stream", get(stream))
-        .route("/user", get(get_authenticated_user))
+        .route("/users/me", get(get_authenticated_user))
+        .route("/users", get(get_users))
         .route_layer(middleware::from_fn(check_auth))
         .route("/health", get(health))
         .route("/authenticate", post(authenticate))
@@ -213,6 +214,52 @@ async fn get_authenticated_user(
     let pool = state.db_pool.clone().0;
     let referrals = get_user_referral_count(&pool, &user.username).await?;
     Ok(Json(AuthenticatedUserResponse { user, referrals }))
+}
+
+#[derive(Deserialize)]
+struct QueryParams {
+    page: Option<i64>,
+    limit: Option<i64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Pagination {
+    has_next: bool,
+    has_prev: bool,
+    current_page: i64,
+    total_pages: i64,
+}
+
+#[derive(Serialize)]
+struct GetUsersResponse {
+    users: Vec<User>,
+    #[serde(flatten)]
+    pagination: Pagination,
+}
+
+async fn get_users(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<QueryParams>,
+) -> Result<Json<GetUsersResponse>, ApiError> {
+    let pool = state.db_pool.clone().0;
+    let page = query.page.unwrap_or(1);
+    let limit = query.limit.unwrap_or(10);
+    let skip = (page - 1) * limit;
+
+    let users = fetch_users(&pool, skip, limit).await?;
+    let count = fetch_total_user_count(&pool).await?;
+
+    let total_pages = (count / limit) + 1;
+    Ok(Json(GetUsersResponse {
+        users,
+        pagination: Pagination {
+            has_next: page < total_pages,
+            has_prev: page > 1,
+            current_page: page,
+            total_pages,
+        },
+    }))
 }
 
 async fn health() -> Json<Value> {
@@ -327,6 +374,7 @@ impl From<String> for InviteCode {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct User {
     username: Username,
     invite_code: InviteCode,
@@ -399,8 +447,7 @@ async fn create_new_user(
     )
     .fetch_one(pool)
     .await
-    .map_err(|e| {
-        println!("{}", e);
+    .map_err(|_| {
         DatabaseError::ServerError
     })?;
 
@@ -417,6 +464,30 @@ async fn get_user_referral_count(pool: &PgPool, username: &Username) -> Result<u
     .map_err(|_| DatabaseError::ServerError)?;
 
     Ok(count.referral_count.unwrap_or(0) as u32)
+}
+
+async fn fetch_users(pool: &PgPool, skip: i64, limit: i64) -> Result<Vec<User>, DatabaseError> {
+    let users: Vec<DbUser> = sqlx::query_as!(
+        DbUser,
+        "select * from users order by username desc limit $1 offset $2",
+        limit,
+        skip
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|_| DatabaseError::ServerError)?;
+
+    let users: Vec<User> = users.into_iter().map(|u| u.into()).collect();
+    Ok(users)
+}
+
+async fn fetch_total_user_count(pool: &PgPool) -> Result<i64, DatabaseError> {
+    let count = sqlx::query!("select count(*) as total from users")
+        .fetch_one(pool)
+        .await
+        .map_err(|_| DatabaseError::ServerError)?;
+
+    Ok(count.total.unwrap_or(0) as i64)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
