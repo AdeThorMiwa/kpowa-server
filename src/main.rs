@@ -168,7 +168,7 @@ async fn authenticate(
         return Ok(Json(token.into()));
     }
 
-    let referrer_id = if let Some(invite_code) = payload.invitation_code {
+    let referrer_username = if let Some(invite_code) = payload.invitation_code {
         get_user_by_invite_code(&pool, &invite_code)
             .await
             .map_err(|_| ApiError::InvalidInviteCode)?
@@ -186,7 +186,7 @@ async fn authenticate(
         code
     };
 
-    let _ = create_new_user(&pool, &payload.username, &invite_code, referrer_id).await?;
+    let _ = create_new_user(&pool, &payload.username, &invite_code, referrer_username).await?;
     let user = get_user_by_username(&pool, &payload.username)
         .await?
         .unwrap();
@@ -322,7 +322,7 @@ async fn check_auth<B>(
     (StatusCode::UNAUTHORIZED).into_response()
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 struct Username(String);
 
 impl Username {
@@ -349,7 +349,7 @@ impl Display for Username {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 struct InviteCode(String);
 
 impl InviteCode {
@@ -470,8 +470,7 @@ async fn fetch_users(pool: &PgPool, query: FetchUserQuery) -> Result<Vec<User>, 
     let mut builder = QueryBuilder::new("select a.*, (select count(referred_by) from users as b where b.referred_by=a.username) as referrals from users as a ");
 
     if let Some(username) = query.username {
-        builder.push(" where username = ");
-        builder.push_bind(username);
+        builder.push(format!("where username like '%{}%'", username));
     }
 
     builder.push(" order by username desc limit ");
