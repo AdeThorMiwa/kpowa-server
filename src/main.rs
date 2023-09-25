@@ -24,7 +24,8 @@ use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation}
 use rand::{distributions::Uniform, prelude::Distribution};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sqlx::{postgres::PgPoolOptions, FromRow, PgPool, Pool, Postgres, QueryBuilder};
+use sqlx::{postgres::PgPoolOptions, FromRow, PgPool, Pool, Postgres, QueryBuilder, Row};
+use time::OffsetDateTime;
 use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -241,6 +242,7 @@ struct GetUsersResponse {
 async fn get_users(
     State(state): State<Arc<AppState>>,
     Query(query): Query<QueryParams>,
+    Extension(user): Extension<User>,
 ) -> Result<Json<GetUsersResponse>, ApiError> {
     let pool = state.db_pool.clone().0;
     let page = query.page.unwrap_or(1);
@@ -249,12 +251,12 @@ async fn get_users(
 
     let query = FetchUserQuery {
         username: query.username,
+        auth_user: user.username.inner(),
         limit,
         skip,
     };
 
-    let users = fetch_users(&pool, query).await?;
-    let count = fetch_total_user_count(&pool).await?;
+    let (users, count) = fetch_users(&pool, query).await?;
 
     let total_pages = (count / limit) + 1;
     Ok(Json(GetUsersResponse {
@@ -395,6 +397,7 @@ struct DbUser {
     invite_code: String,
     referred_by: Option<String>,
     referrals: Option<i64>,
+    created_on: OffsetDateTime,
 }
 
 impl From<DbUser> for User {
@@ -471,22 +474,21 @@ async fn create_new_user(
 
 struct FetchUserQuery {
     username: Option<String>,
+    auth_user: String,
     skip: i64,
     limit: i64,
 }
 
-async fn fetch_users(pool: &PgPool, query: FetchUserQuery) -> Result<Vec<User>, DatabaseError> {
-    let mut builder = QueryBuilder::new("select a.*, (select count(referred_by) from users as b where b.referred_by=a.username) as referrals from users as a ");
+async fn fetch_users(
+    pool: &PgPool,
+    query: FetchUserQuery,
+) -> Result<(Vec<User>, i64), DatabaseError> {
+    tracing::info!("limit >>> {} offset >>> {}", query.limit, query.skip);
+    let mut select_query = QueryBuilder::new("select a.*, (select count(referred_by) from users as b where b.referred_by=a.username) as referrals from users as a ");
+    let builder = append_search_param_to_query(&mut select_query, &query, false, false);
 
-    if let Some(username) = query.username {
-        builder.push(format!("where username like '%{}%'", username));
-    }
-
-    builder.push(" order by username desc limit ");
-    builder.push_bind(query.limit);
-
-    builder.push(" offset ");
-    builder.push_bind(query.skip);
+    let mut count_query = QueryBuilder::new("select count(*) from users as count ");
+    let count_builder = append_search_param_to_query(&mut count_query, &query, true, true);
 
     let users = builder
         .build_query_as::<DbUser>()
@@ -497,20 +499,41 @@ async fn fetch_users(pool: &PgPool, query: FetchUserQuery) -> Result<Vec<User>, 
             DatabaseError::ServerError
         })?;
 
+    let count = count_builder.build().fetch_one(pool).await.map_err(|e| {
+        tracing::error!("fetch total user count failed >>> {}", e);
+        DatabaseError::ServerError
+    })?;
+
     let users: Vec<User> = users.into_iter().map(|u| u.into()).collect();
-    Ok(users)
+    Ok((users, count.get("count")))
 }
 
-async fn fetch_total_user_count(pool: &PgPool) -> Result<i64, DatabaseError> {
-    let count = sqlx::query!("select count(*) as total from users")
-        .fetch_one(pool)
-        .await
-        .map_err(|e| {
-            tracing::error!("fetch total user count failed >>> {}", e);
-            DatabaseError::ServerError
-        })?;
+fn append_search_param_to_query<'a>(
+    builder: &'a mut QueryBuilder<'a, Postgres>,
+    query: &FetchUserQuery,
+    skip_ordering: bool,
+    skip_pagination: bool,
+) -> &'a mut QueryBuilder<'a, Postgres> {
+    builder.push(" where username != ");
+    builder.push_bind(query.auth_user.clone());
 
-    Ok(count.total.unwrap_or(0) as i64)
+    if let Some(username) = &query.username {
+        builder.push(format!(" and username like '%{}%' ", username));
+    }
+
+    if !skip_ordering {
+        builder.push(" order by created_on desc ");
+    }
+
+    if !skip_pagination {
+        builder.push(" limit ");
+        builder.push_bind(query.limit);
+
+        builder.push(" offset ");
+        builder.push_bind(query.skip);
+    }
+
+    builder
 }
 
 #[derive(Debug, Serialize, Deserialize)]
