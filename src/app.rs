@@ -1,6 +1,10 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+};
 
 use crate::{
+    config::{Config, DatabaseConfig},
     domain::events::AppEvent,
     routes::{
         auth::{authenticate, check_auth},
@@ -31,8 +35,8 @@ impl Db {
 #[derive(Clone)]
 pub struct AppState {
     db_pool: Db,
-
     tx: broadcast::Sender<AppEvent>,
+    pub config: Config,
 }
 
 impl AppState {
@@ -48,16 +52,15 @@ impl AppState {
 pub struct Application;
 
 impl Application {
-    pub async fn build() {
-        Self::setup_tracing("info");
-        dotenv::dotenv().expect("Unable to load environment variables from .env file");
-        let db_url = std::env::var("DATABASE_URL").expect("Unable to read DATABASE_URL env var");
+    pub async fn build(config: Config) -> anyhow::Result<()> {
+        Self::setup_tracing(&config.application.debug_mode);
 
-        let db_pool = Self::get_pool(&db_url).await;
+        let db_pool = Self::get_pool(&config.database).await;
         let (tx, _rx) = broadcast::channel(100);
         let app_state = Arc::new(AppState {
             db_pool: db_pool.clone(),
             tx,
+            config: config.clone(),
         });
 
         let cors = CorsLayer::permissive();
@@ -70,14 +73,18 @@ impl Application {
             .route("/authenticate", post(authenticate))
             .with_state(app_state)
             .layer(Extension(db_pool.clone()))
+            .layer(Extension(config.clone()))
             .layer(cors);
 
-        let addr = "0.0.0.0:8009".parse::<SocketAddr>().unwrap();
+        let ip = config.application.host.parse::<IpAddr>()?;
+        let addr = SocketAddr::new(ip, config.application.port);
         tracing::info!("listening on {}", addr.port());
         axum::Server::bind(&addr)
             .serve(app.into_make_service())
             .await
             .unwrap();
+
+        Ok(())
     }
 
     fn setup_tracing(debug_mode: &str) {
@@ -90,13 +97,10 @@ impl Application {
             .init();
     }
 
-    async fn get_pool(db_url: &str) -> Db {
+    async fn get_pool(db_config: &DatabaseConfig) -> Db {
         let pool = PgPoolOptions::new()
-            .max_connections(5)
-            .acquire_timeout(Duration::from_secs(3))
-            .connect(&db_url)
-            .await
-            .expect("can't connect to database");
+            .acquire_timeout(std::time::Duration::from_secs(2))
+            .connect_lazy_with(db_config.get_connect_options());
         Db(pool)
     }
 }

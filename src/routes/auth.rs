@@ -1,5 +1,6 @@
 use crate::{
     app::{AppState, Db},
+    config::Config,
     domain::{
         errors::ApiError,
         events::{AppEvent, NewReferralEvent},
@@ -47,7 +48,7 @@ pub async fn authenticate(
 
     if let Some(user) = user {
         let _ = state.get_sender().send(AppEvent::NewLogin(user.clone()));
-        let token = generate_auth_token(&user.username)?;
+        let token = generate_auth_token(&user.username, &state.config.jwt)?;
         return Ok(Json(token.into()));
     }
 
@@ -83,7 +84,7 @@ pub async fn authenticate(
     }
 
     let _ = state.get_sender().send(AppEvent::NewRegister(user.clone()));
-    let token = generate_auth_token(&user.username)?;
+    let token = generate_auth_token(&user.username, &state.config.jwt)?;
     Ok(Json(token.into()))
 }
 
@@ -92,7 +93,12 @@ pub async fn check_auth<B>(
     mut request: Request<B>,
     next: Next<B>,
 ) -> Response {
-    let token = decode_auth_token(auth.token());
+    let config = match request.extensions().get::<Config>() {
+        Some(c) => c,
+        None => return (StatusCode::INTERNAL_SERVER_ERROR).into_response(),
+    };
+
+    let token = decode_auth_token(auth.token(), &config.jwt);
 
     let db = match request.extensions().get::<Db>() {
         Some(s) => s,

@@ -1,0 +1,15 @@
+application:
+  host: 127.0.0.1
+  port: 8009
+  debug_mode: info
+database:
+  host: "127.0.0.1"
+  port: 5432
+  username: "postgres"
+  password: "password"
+  database_name: "newsletter"
+jwt:
+  secret: secret-new
+  iss: "killpowa"
+  exp: 86400 # in secs
+

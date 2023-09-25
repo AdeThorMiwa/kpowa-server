@@ -1,16 +1,23 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use secrecy::ExposeSecret;
 
-use crate::domain::{
-    errors::JWTError,
-    fields::{Claims, Username},
+use crate::{
+    config::JwtConfig,
+    domain::{
+        errors::JWTError,
+        fields::{Claims, Username},
+    },
 };
 
-pub fn generate_auth_token(username: &Username) -> Result<String, JWTError> {
-    let exp = SystemTime::now() + Duration::from_secs(864000);
+pub fn generate_auth_token(
+    username: &Username,
+    jwt_config: &JwtConfig,
+) -> Result<String, JWTError> {
+    let exp = SystemTime::now() + Duration::from_secs(jwt_config.exp);
     let claims = Claims {
-        iss: "killpowa".to_string(),
+        iss: jwt_config.iss.clone(),
         sub: username.inner(),
         exp: exp.duration_since(UNIX_EPOCH).unwrap().as_secs() as usize,
     };
@@ -18,7 +25,7 @@ pub fn generate_auth_token(username: &Username) -> Result<String, JWTError> {
     let token = encode(
         &Header::default(),
         &claims,
-        &EncodingKey::from_secret("secret".as_ref()),
+        &EncodingKey::from_secret(jwt_config.secret.expose_secret().as_ref()),
     )
     .map_err(|e| {
         tracing::error!("auth token generation failed >>> {}", e);
@@ -28,10 +35,10 @@ pub fn generate_auth_token(username: &Username) -> Result<String, JWTError> {
     Ok(token)
 }
 
-pub fn decode_auth_token(token: &str) -> Result<Claims, JWTError> {
+pub fn decode_auth_token(token: &str, jwt_config: &JwtConfig) -> Result<Claims, JWTError> {
     let token_data = decode::<Claims>(
         &token,
-        &DecodingKey::from_secret("secret".as_ref()),
+        &DecodingKey::from_secret(jwt_config.secret.expose_secret().as_ref()),
         &Validation::default(),
     )
     .map_err(|e| {
