@@ -419,7 +419,10 @@ async fn get_user_by_username(
     )
     .fetch_optional(pool)
     .await
-    .map_err(|_| DatabaseError::ServerError)?;
+    .map_err(|e| {
+         tracing::error!("get user by username failed >>> {}",e);
+         DatabaseError::ServerError
+    })?;
 
     Ok(user.map(|u| u.into()))
 }
@@ -435,7 +438,10 @@ async fn get_user_by_invite_code(
     )
     .fetch_optional(pool)
     .await
-    .map_err(|_| DatabaseError::ServerError)?;
+    .map_err(|e| {
+        tracing::error!("get user by invite failed >>> {}",e);
+        DatabaseError::ServerError
+    })?;
 
     Ok(user.map(|u| u.into()))
 }
@@ -453,9 +459,12 @@ async fn create_new_user(
         invite_code.inner(),
         referred_by.map(|r| r.inner())
     )
-    .fetch_one(pool)
+    .execute(pool)
     .await
-    .map_err(|_| DatabaseError::ServerError)?;
+    .map_err(|e| {
+        tracing::error!("creating user failed >>> {}", e);
+        DatabaseError::ServerError
+    })?;
 
     Ok(())
 }
@@ -483,7 +492,10 @@ async fn fetch_users(pool: &PgPool, query: FetchUserQuery) -> Result<Vec<User>, 
         .build_query_as::<DbUser>()
         .fetch_all(pool)
         .await
-        .map_err(|_| DatabaseError::ServerError)?;
+        .map_err(|e| {
+            tracing::error!("getting list of user failed >>> {}", e);
+            DatabaseError::ServerError
+        })?;
 
     let users: Vec<User> = users.into_iter().map(|u| u.into()).collect();
     Ok(users)
@@ -493,7 +505,10 @@ async fn fetch_total_user_count(pool: &PgPool) -> Result<i64, DatabaseError> {
     let count = sqlx::query!("select count(*) as total from users")
         .fetch_one(pool)
         .await
-        .map_err(|_| DatabaseError::ServerError)?;
+        .map_err(|e| {
+            tracing::error!("fetch total user count failed >>> {}", e);
+            DatabaseError::ServerError
+        })?;
 
     Ok(count.total.unwrap_or(0) as i64)
 }
@@ -530,7 +545,10 @@ fn generate_auth_token(username: &Username) -> Result<String, JWTError> {
         &claims,
         &EncodingKey::from_secret("secret".as_ref()),
     )
-    .map_err(|e| JWTError::GenerationFailed(e.into_kind()))?;
+    .map_err(|e| {
+        tracing::error!("auth token generation failed >>> {}", e);
+        JWTError::GenerationFailed(e.into_kind())
+    })?;
 
     Ok(token)
 }
@@ -541,7 +559,10 @@ fn decode_auth_token(token: &str) -> Result<Claims, JWTError> {
         &DecodingKey::from_secret("secret".as_ref()),
         &Validation::default(),
     )
-    .map_err(|e| JWTError::DecodeFailed(e.into_kind()))?;
+    .map_err(|e| {
+        tracing::error!("auth token decode failed >>> {}", e);
+        JWTError::DecodeFailed(e.into_kind())
+    })?;
 
     Ok(token_data.claims)
 }
