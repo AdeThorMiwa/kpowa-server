@@ -19,7 +19,7 @@ $ cd kpower-server
 
 Update config values in the `config/base.yaml` file or create an `.env` file from the `.env.sample` file and provide the appropriate config values
 
-**NOTE:** Security sensitive configurations should be set (or override) from the `.env` file
+**NOTE:** Security sensitive configurations (like database password and jwt secret) should be set (or override) from the `.env` file
 
 ### Setup database
 
