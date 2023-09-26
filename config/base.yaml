@@ -1,15 +1,17 @@
 application:
   host: 127.0.0.1
   port: 8009
-  debug_mode: info
+  log_level: info
+
 database:
   host: "127.0.0.1"
   port: 5432
   username: "postgres"
   password: "password"
-  database_name: "newsletter"
+  database_name: "dbname"
+
 jwt:
-  secret: secret-new
+  secret: secret-new # use a strong secret
   iss: "killpowa"
   exp: 86400 # in secs
 

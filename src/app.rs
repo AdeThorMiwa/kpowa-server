@@ -53,7 +53,7 @@ pub struct Application;
 
 impl Application {
     pub async fn build(config: Config) -> anyhow::Result<()> {
-        Self::setup_tracing(&config.application.debug_mode);
+        Self::setup_tracing(&config.application.log_level);
 
         let db_pool = Self::get_pool(&config.database).await;
         let (tx, _rx) = broadcast::channel(100);
@@ -87,11 +87,11 @@ impl Application {
         Ok(())
     }
 
-    fn setup_tracing(debug_mode: &str) {
+    fn setup_tracing(log_level: &str) {
         tracing_subscriber::registry()
             .with(
                 tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| debug_mode.into()),
+                    .unwrap_or_else(|_| log_level.into()),
             )
             .with(tracing_subscriber::fmt::layer())
             .init();

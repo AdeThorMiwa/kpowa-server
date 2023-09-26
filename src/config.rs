@@ -39,7 +39,7 @@ pub struct ApplicationConfig {
     pub host: String,
     #[serde(deserialize_with = "deserialize_number_from_string")]
     pub port: u16,
-    pub debug_mode: String,
+    pub log_level: String,
 }
 
 #[derive(serde::Deserialize, Clone)]
