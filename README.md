@@ -12,7 +12,7 @@ A basic auth server powered by axum and sqlx (Postgres) and uses SSE (Server Sen
 ### Clone repo and cd into repo
 
 ```bash
-$ git clone https://github.com/AdeThorMiwa/kpower-server
+$ git clone https://github.com/AdeThorMiwa/kpowa-server
 
 $ cd kpower-server
 ```
